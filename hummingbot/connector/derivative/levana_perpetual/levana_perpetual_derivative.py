@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 
+# this is requierd to avoid duplicate type error
 # Add this before cosmpy imports
 import sys
 import time
@@ -12,6 +13,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from bidict import bidict
+from google.protobuf import descriptor_pool
 from pydantic import BaseModel, Field, root_validator
 
 import hummingbot.connector.derivative.levana_perpetual.levana_perpetual_constants as CONSTANTS
@@ -24,9 +26,6 @@ from hummingbot.connector.derivative.levana_perpetual.levana_perpetual_api_order
 )
 from hummingbot.connector.derivative.levana_perpetual.levana_perpetual_auth import (
     LevanaPerpetualAuth,
-)
-from hummingbot.connector.derivative.levana_perpetual.levana_perpetual_user_stream_data_source import (
-    LevanaPerpetualUserStreamDataSource,
 )
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.perpetual_derivative_py_base import (
@@ -93,91 +92,6 @@ cfg = NetworkConfig(
 _markets_dict = CONSTANTS._production_markets_dict
 global_client = LedgerClient(cfg)
 _market_snapshot = {}
-
-
-def get_market_price_from_contract(market_contract):
-    res = market_contract.query({"spot_price": {}})
-    print(json.dumps(res, indent=2))
-    price_data = PriceData(**res)
-    return price_data.price_base
-
-
-def _get_market_contract(ticker: str) -> LedgerContract:
-    market = _market_snapshot[ticker]
-    market_contract_address = market.info.market_addr
-    market_contract = LedgerContract(
-        None, global_client, market_contract_address
-    )
-    return market_contract
-
-
-def market_execute_send(
-    market: LevanaMarket, wallet, message: dict, send_amount: float
-) -> TxResponse:
-    if market.status.collateral.native:  # type: ignore
-        market_contract = _get_market_contract(market.ticker)
-        native_collateral_denom = market.status.collateral.native.denom  # type: ignore
-        collateral_send_amount = int(
-            send_amount * 10**market.status.collateral.native.decimal_places  # type: ignore
-        )
-        send_string = repr(collateral_send_amount) + native_collateral_denom
-        tx = market_contract.execute(
-            message, wallet, CONSTANTS.GAS_LIMIT, send_string
-        )
-    else:
-        cw20_collateral_address = market.status.collateral.cw20.addr  # type: ignore
-        msg_json = json.dumps(message)
-        msg_bytes = msg_json.encode("utf-8")
-        msg_base64 = base64.b64encode(msg_bytes).decode("utf-8")
-        cw20_send_amount = int(
-            send_amount * 10**market.status.collateral.cw20.decimal_places  # type: ignore
-        )
-        cw20_msg = {
-            "send": {
-                "contract": market.info.market_addr,  # type: ignore
-                # "amount": "1000000",
-                "amount": repr(cw20_send_amount),
-                # "amount": "5000000",
-                # "msg": "eyJvcGVuX3Bvc2l0aW9uIjp7ImxldmVyYWdlIjoiMiIsImRpcmVjdGlvbiI6ImxvbmciLCJzbGlwcGFnZV9hc3NlcnQiOnsicHJpY2UiOiI1Ljk3MDMyMzQ3MDExMzU0MTYzNiIsInRvbGVyYW5jZSI6IjAuMDA1In0sInRha2VfcHJvZml0IjoiNy45NDM4NDMifX0=", pylint: disable=line-too-long
-                "msg": msg_base64,
-            }
-        }
-        print(json.dumps(cw20_msg, indent=2))
-        collateral_contract = LedgerContract(
-            None, global_client, Address(cw20_collateral_address)
-        )
-        tx = collateral_contract.execute(
-            cw20_msg, wallet, CONSTANTS.GAS_LIMIT, None
-        )
-    try:
-        tx.wait_to_complete()
-    except Exception as e:
-        if tx.response is not None:
-            raise ValueError(tx.response.raw_log)
-        else:
-            raise e
-    if tx.response is not None and tx.response.is_successful:
-        if "failed to execute message;" in tx.response.raw_log:
-            raise ValueError(tx.response.logs)
-        print("Transaction response:", tx.response)
-        return tx.response
-    else:
-        raise ValueError(tx.response)
-
-
-def market_execute(market, wallet, message) -> TxResponse:
-    """things like things like close, don't require a send amount"""
-    market_contract = _get_market_contract(market.ticker)
-    submitted_tx = market_contract.execute(
-        message, wallet, CONSTANTS.GAS_LIMIT, None
-    ).wait_to_complete()
-    if (
-        submitted_tx.response is not None
-        and submitted_tx.response.is_successful
-    ):
-        print("Transaction response:", submitted_tx.response)
-        return submitted_tx.response
-    raise ValueError(submitted_tx.response)
 
 
 # define error for out of funds
@@ -467,20 +381,22 @@ class LevanaPerpetualDerivative(PerpetualDerivativePyBase):
     def __init__(
         self,
         client_config_map: "ClientConfigAdapter",
-        levana_perpetual_api_key: str = None,
-        levana_perpetual_secret_key: str = None,
+        levana_perpetual_secret_phrase: str = None,
+        levana_perpetual_chain_address: str = None,
         trading_pairs: Optional[List[str]] = None,
         trading_required: bool = True,
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
     ):
 
-        self.levana_perpetual_api_key = levana_perpetual_api_key
-        self.levana_perpetual_secret_key = levana_perpetual_secret_key
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._domain = domain
         self._last_trade_history_timestamp = None
         self._trading_pair_leverage = {}
+        self._wallet = LocalWallet.from_mnemonic(
+            levana_perpetual_secret_phrase, prefix="osmo"
+        )
+        self._wallet_address = levana_perpetual_chain_address
 
         super().__init__(client_config_map)
 
@@ -490,10 +406,7 @@ class LevanaPerpetualDerivative(PerpetualDerivativePyBase):
 
     @property
     def authenticator(self) -> LevanaPerpetualAuth:
-        return LevanaPerpetualAuth(
-            self.levana_perpetual_api_key,
-            self.levana_perpetual_secret_key,
-        )
+        pass
 
     @property
     def rate_limits_rules(self) -> List[RateLimit]:
@@ -733,6 +646,7 @@ class LevanaPerpetualDerivative(PerpetualDerivativePyBase):
         )
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+        return None
         return LevanaPerpetualUserStreamDataSource(
             auth=self._auth,
             api_factory=self._web_assistants_factory,
@@ -1537,3 +1451,88 @@ class LevanaPerpetualDerivative(PerpetualDerivativePyBase):
             throttler_limit_id=limit_id if limit_id else path_url,
         )
         return resp
+
+
+def get_market_price_from_contract(market_contract):
+    res = market_contract.query({"spot_price": {}})
+    print(json.dumps(res, indent=2))
+    price_data = PriceData(**res)
+    return price_data.price_base
+
+
+def _get_market_contract(ticker: str) -> LedgerContract:
+    market = _market_snapshot[ticker]
+    market_contract_address = market.info.market_addr
+    market_contract = LedgerContract(
+        None, global_client, market_contract_address
+    )
+    return market_contract
+
+
+def market_execute_send(
+    market: LevanaMarket, wallet, message: dict, send_amount: float
+) -> TxResponse:
+    if market.status.collateral.native:  # type: ignore
+        market_contract = _get_market_contract(market.ticker)
+        native_collateral_denom = market.status.collateral.native.denom  # type: ignore
+        collateral_send_amount = int(
+            send_amount * 10**market.status.collateral.native.decimal_places  # type: ignore
+        )
+        send_string = repr(collateral_send_amount) + native_collateral_denom
+        tx = market_contract.execute(
+            message, wallet, CONSTANTS.GAS_LIMIT, send_string
+        )
+    else:
+        cw20_collateral_address = market.status.collateral.cw20.addr  # type: ignore
+        msg_json = json.dumps(message)
+        msg_bytes = msg_json.encode("utf-8")
+        msg_base64 = base64.b64encode(msg_bytes).decode("utf-8")
+        cw20_send_amount = int(
+            send_amount * 10**market.status.collateral.cw20.decimal_places  # type: ignore
+        )
+        cw20_msg = {
+            "send": {
+                "contract": market.info.market_addr,  # type: ignore
+                # "amount": "1000000",
+                "amount": repr(cw20_send_amount),
+                # "amount": "5000000",
+                # "msg": "eyJvcGVuX3Bvc2l0aW9uIjp7ImxldmVyYWdlIjoiMiIsImRpcmVjdGlvbiI6ImxvbmciLCJzbGlwcGFnZV9hc3NlcnQiOnsicHJpY2UiOiI1Ljk3MDMyMzQ3MDExMzU0MTYzNiIsInRvbGVyYW5jZSI6IjAuMDA1In0sInRha2VfcHJvZml0IjoiNy45NDM4NDMifX0=", pylint: disable=line-too-long
+                "msg": msg_base64,
+            }
+        }
+        print(json.dumps(cw20_msg, indent=2))
+        collateral_contract = LedgerContract(
+            None, global_client, Address(cw20_collateral_address)
+        )
+        tx = collateral_contract.execute(
+            cw20_msg, wallet, CONSTANTS.GAS_LIMIT, None
+        )
+    try:
+        tx.wait_to_complete()
+    except Exception as e:
+        if tx.response is not None:
+            raise ValueError(tx.response.raw_log)
+        else:
+            raise e
+    if tx.response is not None and tx.response.is_successful:
+        if "failed to execute message;" in tx.response.raw_log:
+            raise ValueError(tx.response.logs)
+        print("Transaction response:", tx.response)
+        return tx.response
+    else:
+        raise ValueError(tx.response)
+
+
+def market_execute(market, wallet, message) -> TxResponse:
+    """things like things like close, don't require a send amount"""
+    market_contract = _get_market_contract(market.ticker)
+    submitted_tx = market_contract.execute(
+        message, wallet, CONSTANTS.GAS_LIMIT, None
+    ).wait_to_complete()
+    if (
+        submitted_tx.response is not None
+        and submitted_tx.response.is_successful
+    ):
+        print("Transaction response:", submitted_tx.response)
+        return submitted_tx.response
+    raise ValueError(submitted_tx.response)
